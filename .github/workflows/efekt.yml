@@ -1,1 +1,120 @@
+name: efekt
 
+# Builds the SPHS phaser VST3 for an Intel iMac 2011 (macOS 10.13, x86_64 only).
+# How to use: upload AX300B-SPHS.zip to the top folder of the repository.
+# The build unpacks the ZIP by itself. Download the result from the run page
+# ("Artifacts" -> SPHS-Phaser-macOS-x86_64).
+
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/efekt.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      # Steinberg VST3 SDK 3.7.8 (tag v3.7.8_build_34) - pinned, do not change silently
+      SDK_COMMIT: 0041ef2c879c3c54c03d33cdc11a97eaebfb5752
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v4
+
+      - name: Unpack the project ZIP
+        run: |
+          set -euo pipefail
+          ZIP="AX300B-SPHS.zip"
+          if [ ! -f "$ZIP" ]; then ZIP="$(ls -t *.zip | head -1)"; fi
+          echo "Using ZIP: $ZIP"
+          rm -rf src && mkdir src
+          unzip -q "$ZIP" -d src
+          PLUGIN_DIR="$(find src -maxdepth 3 -type d -name plugin | head -1)"
+          test -n "$PLUGIN_DIR"
+          ROOT="$(cd "$(dirname "$PLUGIN_DIR")" && pwd)"
+          test -f "$ROOT/CMakeLists.txt"
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+
+      - name: Fetch the pinned VST3 SDK
+        run: |
+          set -euo pipefail
+          git clone --recurse-submodules https://github.com/steinbergmedia/vst3sdk.git
+          git -C vst3sdk checkout "$SDK_COMMIT"
+          git -C vst3sdk submodule update --init --recursive
+          test "$(git -C vst3sdk rev-parse HEAD)" = "$SDK_COMMIT"
+
+      - name: DSP library tests
+        run: |
+          set -euo pipefail
+          cmake -S "$PROJECT_ROOT" -B build-dsp -DSPHS_BUILD_PLUGIN=OFF -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+          cmake --build build-dsp --config Release -j 4
+          ./build-dsp/tests/sphs_dsp_tests | tee dsp_tests.log
+
+      - name: Configure the plug-in (Xcode, x86_64, macOS 10.13, Release)
+        run: |
+          set -euo pipefail
+          cmake -S "$PROJECT_ROOT" -B build -G Xcode \
+                -DVST3_SDK_ROOT="$PWD/vst3sdk" \
+                -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                -DSPHS_BUILD_TESTS=OFF \
+                -DSMTG_RUN_VST_VALIDATOR=OFF
+
+      - name: Build the plug-in and the Steinberg validator
+        run: |
+          set -euo pipefail
+          cmake --build build --config Release --target SPHS-Phaser -- -quiet
+          cmake --build build --config Release --target validator -- -quiet
+
+      - name: Check the bundle (Intel only, macOS 10.13, exports)
+        run: |
+          set -euo pipefail
+          VST="$(find build -type d -name 'SPHS-Phaser.vst3' | head -1)"
+          test -n "$VST"
+          echo "VST3_BUNDLE=$PWD/$VST" >> "$GITHUB_ENV"
+          BIN="$VST/Contents/MacOS/SPHS-Phaser"
+          test -f "$BIN"
+          codesign --force --deep -s - "$VST"
+          echo "--- architectures"; lipo -archs "$BIN"
+          test "$(lipo -archs "$BIN")" = "x86_64"
+          echo "--- minimum macOS"; otool -l "$BIN" | grep -A4 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION' | head -12
+          MINOS="$(otool -l "$BIN" | awk '/LC_VERSION_MIN_MACOSX/{f=1} f&&/version /{print $2; exit}')"
+          if [ -z "$MINOS" ]; then MINOS="$(otool -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos /{print $2; exit}')"; fi
+          echo "minimum macOS in the binary: $MINOS"
+          test "$MINOS" = "10.13" || test "$MINOS" = "10.13.0"
+          echo "--- exported entry points"; nm -gU "$BIN" | grep -E 'GetPluginFactory|bundleEntry|bundleExit'
+          test "$(nm -gU "$BIN" | grep -cE 'GetPluginFactory|bundleEntry|bundleExit')" -ge 3
+          echo "--- Info.plist"; plutil -p "$VST/Contents/Info.plist"
+          echo "--- moduleinfo"; cat "$VST/Contents/Resources/moduleinfo.json" || true
+          codesign --verify --deep --verbose=2 "$VST"
+
+      - name: Steinberg VST3 validator
+        run: |
+          set -euo pipefail
+          VAL="$(find build -type f -name validator -perm +111 | head -1)"
+          test -n "$VAL"
+          "$VAL" "$VST3_BUNDLE" | tee validator.log
+          grep -q ", 0 tests failed" validator.log
+
+      - name: Pack the result
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "$VST3_BUNDLE" SPHS-Phaser-macOS-x86_64.zip
+          ls -la SPHS-Phaser-macOS-x86_64.zip
+
+      - name: Upload the plug-in
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPHS-Phaser-macOS-x86_64
+          path: |
+            SPHS-Phaser-macOS-x86_64.zip
+            validator.log
+            dsp_tests.log
+          if-no-files-found: error
